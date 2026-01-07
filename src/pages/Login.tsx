@@ -62,7 +62,7 @@ export default function Login() {
     if (!userOrEmail) { setErr('Ingresá tu usuario o email para enviar el enlace de recuperación.'); return; }
     const email = await resolveEmail(userOrEmail);
     if (!email) { setErr('Usuario o email no encontrado.'); return; }
-    const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: window.location.origin });
+  const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo: `${window.location.origin}/reset` });
     if (error) setErr(error.message);
     else setErr('Te enviamos un email para recuperar la contraseña.');
   };

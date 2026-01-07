@@ -3,7 +3,7 @@ import { useAuth } from '../state/AuthProvider';
 import logo from '../assets/logo.png';
 import { supabase } from '../lib/supabaseClient';
 
-type Battery = { voltage_v: number; ah: number; unit_price_usd: number; is_active: boolean };
+type Battery = { id: number; ah: number; unit_price_usd: number; is_active: boolean; margen_ganancia?: number | null };
 type CabinetBracket = { min_qty: number; max_qty: number; price_usd: number };
 type CalcResult = {
   unit_price_usd: number;
@@ -14,7 +14,8 @@ type CalcResult = {
   final_price_usd: number;
   currency: string;
 };
-type AppSettings = { gain_pct: number | null; cabinet_pct_ge12: number | null };
+// Extend AppSettings to include cabinet_base_usd
+type AppSettings = { gain_pct: number | null; cabinet_pct_ge12: number | null; cabinet_base_usd?: number | null; bonus_threshold_usd?: number | null; bonus_max_vendor_pct?: number | null };
 
 export default function Admin() {
   const { userRow, signOut } = useAuth();
@@ -26,35 +27,41 @@ export default function Admin() {
   const [ok, setOk] = useState<string|null>(null);
 
   // form agregar batería
-  const [newVolt, setNewVolt] = useState('');
   const [newAh, setNewAh] = useState('');
   const [newPrice, setNewPrice] = useState('');
+  const [newMargin, setNewMargin] = useState('');
 
-  // ajustes de margen
-  const [gainPct, setGainPct] = useState<string>('');
+  // ajustes de margen (remove global gain state)
+  // const [gainPct, setGainPct] = useState<string>('');
   const [cabPct, setCabPct] = useState<string>('');
+  const [bonusCapStr, setBonusCapStr] = useState<string>('');
   const [settings, setSettings] = useState<AppSettings>({ gain_pct: null, cabinet_pct_ge12: null });
 
   // calculadora
   const [selAh, setSelAh] = useState<string>('');
-  const [selVolt, setSelVolt] = useState<string>('');
   const [qtyInput, setQtyInput] = useState<string>('');
   const [res, setRes] = useState<CalcResult|null>(null);
   const [calcErr, setCalcErr] = useState<string|null>(null);
   const [calcLoading, setCalcLoading] = useState(false);
+  // Add bonificación state
+  const [bonusPctInput, setBonusPctInput] = useState<string>('');
+  const [discountedPrice, setDiscountedPrice] = useState<number | null>(null);
 
   useEffect(() => {
     // Cargar settings globales (fila única)
     supabase
       .from('app_settings')
-      .select('gain_pct, cabinet_pct_ge12')
+      .select('cabinet_pct_ge12, cabinet_base_usd, bonus_threshold_usd, bonus_max_vendor_pct')
       .limit(1)
       .single()
       .then(({ data }) => {
         if (data) {
-          setSettings({ gain_pct: data.gain_pct, cabinet_pct_ge12: data.cabinet_pct_ge12 });
-          setGainPct(data.gain_pct != null ? String(data.gain_pct) : '');
+          // Mantener solo el gabinete en UI; margen global se maneja por batería
+          setSettings({ gain_pct: null, cabinet_pct_ge12: data.cabinet_pct_ge12, cabinet_base_usd: (data as any).cabinet_base_usd, bonus_threshold_usd: (data as any).bonus_threshold_usd, bonus_max_vendor_pct: (data as any).bonus_max_vendor_pct });
           setCabPct(data.cabinet_pct_ge12 != null ? String(data.cabinet_pct_ge12) : '');
+          const dbCap = (data as any).bonus_max_vendor_pct as number | null | undefined;
+          // Mostrar tal cual está en DB (0–1) o 10 por defecto si no hay valor.
+          setBonusCapStr(dbCap != null ? String(dbCap) : '10');
         }
       });
   }, []);
@@ -63,9 +70,8 @@ export default function Admin() {
     setErr(null); setOk(null); setLoading(true);
     const { data, error } = await supabase
       .from('batteries')
-      .select('voltage_v, ah, unit_price_usd, is_active')
-      .order('ah', { ascending: true })
-      .order('voltage_v', { ascending: true });
+      .select('id, ah, unit_price_usd, is_active, margen_ganancia')
+      .order('ah', { ascending: true });
     setLoading(false);
     if (error) setErr(error.message);
     else setBats((data ?? []) as Battery[]);
@@ -87,28 +93,30 @@ export default function Admin() {
     () => Array.from(new Set(bats.filter(b=>b.is_active).map((b) => b.ah))).sort((a, b) => a - b),
     [bats]
   );
-  const voltOptions = useMemo(
-    () => (selAh === '' ? [] : bats.filter((b) => b.is_active && String(b.ah) === selAh).map((b) => b.voltage_v)),
-    [bats, selAh]
-  );
+  // Eliminamos el selector de voltaje en la calculadora del Admin
 
   function calculate() {
     setCalcErr(null); setRes(null);
-    const ah = Number(selAh); const volt = Number(selVolt); const qty = Number(qtyInput);
-    if (!Number.isFinite(ah) || !Number.isFinite(volt) || !Number.isFinite(qty) || qty <= 0) {
-      setCalcErr('Completá Ah, Volt y cantidad > 0'); return;
+    setDiscountedPrice(null);
+    const ah = Number(selAh); const qty = Number(qtyInput);
+    if (!Number.isFinite(ah) || !Number.isFinite(qty) || qty <= 0) {
+      setCalcErr('Completá Ah y cantidad > 0'); return;
     }
     setCalcLoading(true);
-    const match = bats.find((b) => b.is_active && b.ah === ah && b.voltage_v === volt);
-    if (!match) { setCalcLoading(false); setCalcErr('No hay precio para esa combinación'); return; }
+    const match = bats.find((b) => b.is_active && b.ah === ah);
+    if (!match) { setCalcLoading(false); setCalcErr('No hay precio para ese Ah'); return; }
     const unit = Number(match.unit_price_usd);
-    const rawG = (settings.gain_pct ?? undefined) ?? (userRow?.gain_pct ?? 0.25);
+    // Usar margen por batería; fallback al usuario o 0.25
+    const rawG = (match.margen_ganancia ?? undefined) ?? (userRow?.gain_pct ?? 0.25);
     const g = rawG > 1 ? rawG / 100 : rawG;
     const rawC = (settings.cabinet_pct_ge12 ?? undefined) ?? (userRow?.cabinet_pct_ge12 ?? 0.15);
     const c = rawC > 1 ? rawC / 100 : rawC;
     const subtotal_batteries = unit * qty;
     let cabinet_cost_usd = 0;
-    if (ah < 12) {
+    const baseCabinet = Number(settings.cabinet_base_usd ?? 0);
+    if (qty === 1 && baseCabinet > 0) {
+      cabinet_cost_usd = baseCabinet;
+    } else if (ah < 12) {
       if (!brackets || brackets.length === 0) { setCalcLoading(false); setCalcErr('No hay precios de gabinete (LT12) configurados'); return; }
       const sortedDesc = [...brackets].sort((a,b) => b.max_qty - a.max_qty);
       const largest = sortedDesc[0];
@@ -130,56 +138,81 @@ export default function Admin() {
       }
       cabinet_cost_usd = cost;
     } else {
-      cabinet_cost_usd = ah >= 12 ? subtotal_batteries * c : 0;
+      // Para ≥12Ah: usar el porcentaje, pero si ese valor es menor al costo base, tomar el base como mínimo
+      if (ah >= 12) {
+        const percentCost = subtotal_batteries * c;
+        // Si hay costo base definido, aplicar el mayor entre porcentaje y base
+        cabinet_cost_usd = baseCabinet > 0 ? Math.max(percentCost, baseCabinet) : percentCost;
+      } else {
+        cabinet_cost_usd = 0;
+      }
     }
     const subtotal_technical = subtotal_batteries + cabinet_cost_usd;
-  const final_price_usd = subtotal_technical * (1 + g);
-    setRes({
-      unit_price_usd: unit,
-      subtotal_batteries,
-      cabinet_cost_usd,
-      subtotal_technical,
-      gain_pct: g,
-      final_price_usd,
-      currency: 'USD',
-    });
+    const final_price_usd = subtotal_technical * (1 + g);
+    setRes({ unit_price_usd: unit, subtotal_batteries, cabinet_cost_usd, subtotal_technical, gain_pct: g, final_price_usd, currency: 'USD' });
     setCalcLoading(false);
+  }
+
+  function applyBonus() {
+    if (!res) return;
+    const raw = bonusPctInput.trim();
+    if (raw === '') { setDiscountedPrice(null); return; }
+    let pct = Number(raw);
+    if (!Number.isFinite(pct) || pct < 0) { setCalcErr('Bonificación inválida'); return; }
+    if (pct > 1) pct = pct / 100; // allow 10 or 0.1
+    const newPrice = res.final_price_usd * (1 - pct);
+    setDiscountedPrice(newPrice);
   }
 
   async function saveBattery(b: Battery) {
     setErr(null); setOk(null); setLoading(true);
     const { error } = await supabase
       .from('batteries')
-  .update({ unit_price_usd: b.unit_price_usd, is_active: b.is_active })
-      .eq('ah', b.ah)
-      .eq('voltage_v', b.voltage_v);
+      .update({ unit_price_usd: b.unit_price_usd, is_active: b.is_active, margen_ganancia: b.margen_ganancia ?? null })
+      .eq('id', b.id);
     setLoading(false);
     if (error) setErr(error.message); else setOk('Batería actualizada');
   }
 
   async function addBattery() {
     setErr(null); setOk(null);
-    const volt = Number(newVolt); const ah = Number(newAh); const price = Number(newPrice);
-    if (!Number.isFinite(volt) || !Number.isFinite(ah) || !Number.isFinite(price)) { setErr('Completa Volt, Ah y Precio'); return; }
+    const ah = Number(newAh); const price = Number(newPrice);
+    let margin = newMargin === '' ? null : Number(newMargin);
+    if (margin != null && Number.isFinite(margin) && margin > 1) margin = margin / 100;
+    if (!Number.isFinite(ah) || !Number.isFinite(price)) { setErr('Completa Ah y Precio'); return; }
     setLoading(true);
     const { error } = await supabase
       .from('batteries')
-      .insert({ voltage_v: volt, ah, unit_price_usd: price, is_active: true });
+      .insert({ ah, unit_price_usd: price, is_active: true, margen_ganancia: margin });
     setLoading(false);
-    if (error) setErr(error.message); else { setOk('Batería agregada'); setNewVolt(''); setNewAh(''); setNewPrice(''); loadBats(); }
+    if (error) setErr(error.message); else { setOk('Batería agregada'); setNewAh(''); setNewPrice(''); setNewMargin(''); loadBats(); }
   }
 
   async function saveSettings() {
     setErr(null); setOk(null);
-    let g = Number(gainPct); let c = Number(cabPct);
-    // Normalizar: si ingresan 80 lo tomamos como 80% => 0.8
-    if (Number.isFinite(g) && g > 1) g = g / 100;
+    let c = Number(cabPct);
     if (Number.isFinite(c) && c > 1) c = c / 100;
-    if (!Number.isFinite(g) || !Number.isFinite(c)) { setErr('Valores inválidos'); return; }
+    if (!Number.isFinite(c)) { setErr('Valor inválido'); return; }
+    // Parse bonus cap allowing 0–1 or %; only normalizar al guardar
+    const rawCap = bonusCapStr.trim();
+    let capNum: number | null = rawCap === '' ? null : Number(rawCap);
+    if (capNum != null && !Number.isFinite(capNum)) {
+      setErr('Tope de bonificación inválido');
+      return;
+    } else if (capNum != null && Number.isFinite(capNum)) {
+      // Si es >1 tratamos como porcentaje (ej: 10 => 0.10), si es <=1 lo tomamos tal cual (0.2)
+      capNum = capNum > 1 ? capNum / 100 : capNum;
+    }
     const { error } = await supabase
       .from('app_settings')
-      .upsert({ id: 1, gain_pct: g, cabinet_pct_ge12: c }, { onConflict: 'id' });
-    if (error) setErr(error.message); else { setOk('Ajustes guardados'); setSettings({ gain_pct: g, cabinet_pct_ge12: c }); }
+      .upsert({ id: 1, cabinet_pct_ge12: c, cabinet_base_usd: (settings.cabinet_base_usd ?? null), bonus_threshold_usd: (settings.bonus_threshold_usd ?? null), bonus_max_vendor_pct: (capNum ?? null) }, { onConflict: 'id' });
+    if (error) setErr(error.message); else {
+      setOk('Ajustes guardados');
+      setSettings({ gain_pct: null, cabinet_pct_ge12: c, cabinet_base_usd: settings.cabinet_base_usd, bonus_threshold_usd: settings.bonus_threshold_usd, bonus_max_vendor_pct: capNum ?? null });
+      // Mostrar valor normalizado en 0–1 tras guardar
+      setBonusCapStr(capNum != null ? String(capNum) : '');
+      setCabPct(String(c));
+    }
   }
 
   return (
@@ -240,7 +273,7 @@ export default function Admin() {
           <div className="tabs">
             <button className={`tab ${tab==='calc'?'active':''}`} onClick={() => setTab('calc')}>Calculadora</button>
             <button className={`tab ${tab==='bats'?'active':''}`} onClick={() => setTab('bats')}>Gestionar Baterías</button>
-            <button className={`tab ${tab==='settings'?'active':''}`} onClick={() => setTab('settings')}>Ajustes de Margen</button>
+            <button className={`tab ${tab==='settings'?'active':''}`} onClick={() => setTab('settings')}>Ajustes Generales</button>
           </div>
 
           {tab==='calc' && (
@@ -252,13 +285,6 @@ export default function Admin() {
                     <select className="select" value={selAh} onChange={(e)=>setSelAh(e.target.value)}>
                       <option value="">Elegir Ah</option>
                       {ahOptions.map((v)=> <option key={v} value={String(v)}>{v}</option>)}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="muted">Voltaje</label>
-                    <select className="select" value={selVolt} onChange={(e)=>setSelVolt(e.target.value)} disabled={selAh===''}>
-                      <option value="">Elegir Volt</option>
-                      {Array.from(new Set(voltOptions)).map((v)=> <option key={v} value={String(v)}>{v}V</option>)}
                     </select>
                   </div>
                   <div>
@@ -279,7 +305,22 @@ export default function Admin() {
                       <div className="result-item"><div className="muted">Subtotal técnico</div><div>USD {res.subtotal_technical.toFixed(2)}</div></div>
                     </div>
                     <p className="muted" style={{marginTop:10}}>Margen de ganancia: {(res.gain_pct! * 100).toFixed(2)}%</p>
-                    <div className="total">Precio final: USD {res.final_price_usd.toFixed(2)}</div>
+                    <div className="total" style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+                      <span>Precio final: USD {res.final_price_usd.toFixed(2)}</span>
+                      <input
+                        className="input"
+                        style={{ width: 140 }}
+                        placeholder="Bonificación %"
+                        type="text"
+                        inputMode="decimal"
+                        value={bonusPctInput}
+                        onChange={(e)=> setBonusPctInput(e.target.value.replace(/[^0-9.]/g,''))}
+                      />
+                      <button className="btn" style={{ width: 'auto', padding: '0 12px' }} onClick={applyBonus}>Aplicar bonificación</button>
+                    </div>
+                    {discountedPrice != null && (
+                      <div className="total" style={{ color:'#065f46' }}>Precio con bonificación: USD {discountedPrice.toFixed(2)}</div>
+                    )}
                   </>
                 )}
               </div>
@@ -296,45 +337,81 @@ export default function Admin() {
                 <table className="table">
                   <thead>
                     <tr>
-                      <th>Volt</th>
                       <th>Ah</th>
                       <th>Precio (USD)</th>
                       <th>Activo</th>
+                      <th>Margen de ganancia</th>
                       <th></th>
                     </tr>
                   </thead>
                   <tbody>
                     {bats.map((b, idx) => (
-                      <tr key={`${b.voltage_v}-${b.ah}-${idx}`}>
-                        <td>{b.voltage_v}V</td>
+                      <tr key={`${b.id}-${idx}`}>
                         <td>{b.ah}</td>
                         <td>
-                          <input className="input" type="number" step="0.01" value={b.unit_price_usd}
-                                 onChange={(e) => {
-                                   const v = Number(e.target.value);
-                                   setBats((prev) => prev.map((x, i) => i===idx ? { ...x, unit_price_usd: v } : x));
-                                 }} />
+                          <input
+                            className="input"
+                            type="number"
+                            step="0.01"
+                            value={b.unit_price_usd}
+                            onChange={(e) => {
+                              const v = Number(e.target.value);
+                              setBats((prev) => prev.map((x, i) => (i === idx ? { ...x, unit_price_usd: v } : x)));
+                            }}
+                          />
                         </td>
                         <td>
                           <label className="switch">
-                            <input type="checkbox" checked={b.is_active}
-                                   onChange={(e) => setBats((prev) => prev.map((x, i) => i===idx ? { ...x, is_active: e.target.checked } : x))} />
+                            <input
+                              type="checkbox"
+                              checked={b.is_active}
+                              onChange={(e) =>
+                                setBats((prev) => prev.map((x, i) => (i === idx ? { ...x, is_active: e.target.checked } : x)))
+                              }
+                            />
                             <span className="muted">{b.is_active ? 'Sí' : 'No'}</span>
                           </label>
                         </td>
-                        <td style={{display:'flex', gap:8}}>
-                          <button className="btn" onClick={() => saveBattery(b)} disabled={loading}>Guardar</button>
-                          <button className="btn btn-danger" onClick={async () => {
-                            if (!confirm('¿Estás seguro de borrarla? Esta acción no se puede deshacer.')) return;
-                            setErr(null); setOk(null); setLoading(true);
-                            const { error } = await supabase
-                              .from('batteries')
-                              .delete()
-                              .eq('ah', b.ah)
-                              .eq('voltage_v', b.voltage_v);
-                            setLoading(false);
-                            if (error) setErr(error.message); else { setOk('Batería borrada'); loadBats(); }
-                          }} disabled={loading}>Borrar</button>
+                        <td>
+                          <input
+                            className="input"
+                            type="number"
+                            step="0.01"
+                            min="0"
+                            max="1"
+                            placeholder="0.25 o 25%"
+                            value={b.margen_ganancia ?? ''}
+                            onChange={(e) => {
+                              let num: number | null = e.target.value === '' ? null : Number(e.target.value);
+                              if (num != null && Number.isFinite(num) && num > 1) num = num / 100;
+                              setBats((prev) => prev.map((x, i) => (i === idx ? { ...x, margen_ganancia: num } : x)));
+                            }}
+                          />
+                          <span className="muted" style={{ fontSize: '0.8rem' }}>0–1 o % (ej: 25 = 25%)</span>
+                        </td>
+                        <td style={{ display: 'flex', gap: 8 }}>
+                          <button className="btn" onClick={() => saveBattery(b)} disabled={loading}>
+                            Guardar
+                          </button>
+                          <button
+                            className="btn btn-danger"
+                            onClick={async () => {
+                              if (!confirm('¿Estás seguro de borrarla? Esta acción no se puede deshacer.')) return;
+                              setErr(null);
+                              setOk(null);
+                              setLoading(true);
+                              const { error } = await supabase.from('batteries').delete().eq('id', b.id);
+                              setLoading(false);
+                              if (error) setErr(error.message);
+                              else {
+                                setOk('Batería borrada');
+                                loadBats();
+                              }
+                            }}
+                            disabled={loading}
+                          >
+                            Borrar
+                          </button>
                         </td>
                       </tr>
                     ))}
@@ -344,9 +421,9 @@ export default function Admin() {
 
                 <h3 style={{marginTop:16}}>Agregar batería</h3>
                 <div className="grid4" style={{marginTop:8}}>
-                  <input className="input" placeholder="Volt" value={newVolt} onChange={(e)=>setNewVolt(e.target.value.replace(/[^0-9]/g,''))} />
                   <input className="input" placeholder="Ah" value={newAh} onChange={(e)=>setNewAh(e.target.value.replace(/[^0-9]/g,''))} />
                   <input className="input" placeholder="Precio USD" value={newPrice} onChange={(e)=>setNewPrice(e.target.value.replace(/[^0-9.]/g,''))} />
+                  <input className="input" placeholder="Margen (0–1 o %)" value={newMargin} onChange={(e)=>setNewMargin(e.target.value.replace(/[^0-9.]/g,''))} />
                   
                   <button className="btn" onClick={addBattery} disabled={loading}>Agregar</button>
                 </div>
@@ -357,23 +434,85 @@ export default function Admin() {
           {tab==='settings' && (
             <div className="card">
               <div className="card-body">
-                <p className="muted">Ajustes globales aplicados al cálculo (ambas calculadoras)</p>
+                <p className="muted">Ajustes globales de gabinete aplicados al cálculo</p>
                 {err && <p style={{ color: 'crimson' }}>{err}</p>}
                 {ok && <p style={{ color: '#0b5ed7' }}>{ok}</p>}
                 <div className="grid4" style={{marginTop:8}}>
                   <div>
-                    <label className="muted">Margen de ganancia (0–1 o %)</label>
-                    <input className="input" type="number" step="0.01" value={gainPct} onChange={(e)=>setGainPct(e.target.value)} />
+                    <label className="muted">Gabinete ≥12Ah (0–1 o %)</label>
+                    <input
+                      className="input"
+                      type="text"
+                      inputMode="decimal"
+                      pattern="[0-9.]*"
+                      value={cabPct}
+                      onChange={(e)=>{
+                        // permitir solo dígitos y punto; mantener como string para luego convertir al guardar
+                        const raw = e.target.value.replace(/[^0-9.]/g,'');
+                        setCabPct(raw);
+                      }}
+                    />
+                    <p className="muted" style={{ marginTop: 6 }}>
+                      Es el porcentaje del valor del gabinete calculado según el costo total de las baterías (aplica para ≥12Ah).
+                    </p>
                   </div>
                   <div>
-                    <label className="muted">Gabinete ≥12Ah (0–1 o %)</label>
-                    <input className="input" type="number" step="0.01" value={cabPct} onChange={(e)=>setCabPct(e.target.value)} />
+                    <label className="muted">Costo base gabinete (qty = 1)</label>
+                    <input
+                      className="input"
+                      type="text"
+                      inputMode="decimal"
+                      pattern="[0-9.]*"
+                      placeholder="50"
+                      value={settings.cabinet_base_usd ?? ''}
+                      onChange={(e)=>{
+                        const raw = e.target.value.replace(/[^0-9.]/g,'').trim();
+                        const val = raw === '' ? null : Number(raw);
+                        setSettings((s)=> ({ ...s, cabinet_base_usd: Number.isFinite(val as number) ? val : s.cabinet_base_usd ?? null }));
+                      }}
+                    />
+                    <p className="muted" style={{ marginTop: 6 }}>Se aplica sólo cuando la cantidad es 1.</p>
+                  </div>
+                  <div>
+                    <label className="muted">Umbral bonificación (USD)</label>
+                    <input
+                      className="input"
+                      type="text"
+                      inputMode="decimal"
+                      pattern="[0-9.]*"
+                      placeholder="ej: 1000"
+                      value={settings.bonus_threshold_usd ?? ''}
+                      onChange={(e)=>{
+                        const raw = e.target.value.replace(/[^0-9.]/g,'').trim();
+                        const val = raw === '' ? null : Number(raw);
+                        setSettings((s)=> ({ ...s, bonus_threshold_usd: Number.isFinite(val as number) ? val : s.bonus_threshold_usd ?? null }));
+                      }}
+                    />
+                    <p className="muted" style={{ marginTop: 6 }}>Para vendedores: sólo aparece el botón si el precio final alcanza este importe.</p>
+                  </div>
+                  <div>
+                    <label className="muted">Tope bonificación (0–1 o %)</label>
+                    <input
+                      className="input"
+                      type="text"
+                      inputMode="decimal"
+                      pattern="[0-9.]*"
+                      placeholder="ej: 0.15 o 15"
+                      value={bonusCapStr}
+                      onChange={(e)=>{
+                        const cleaned = e.target.value
+                          .replace(/[^0-9.]/g, '')
+                          .replace(/(\..*)\./g, '$1');
+                        setBonusCapStr(cleaned);
+                      }}
+                    />
+                    <p className="muted" style={{ marginTop: 6 }}>Acepta 0–1 o %. Se guarda en 0–1. Ejemplos: 0.45 = 45%; 45 = 45% (al guardar se mostrará 0.45). Vacío = sin tope.</p>
                   </div>
                   <div style={{alignSelf:'end'}}>
                     <button className="btn" onClick={saveSettings} disabled={loading}>Guardar ajustes</button>
                   </div>
                 </div>
-                <p className="muted" style={{marginTop:10}}>El vendedor no ve el valor del margen, pero el precio final lo incluye.</p>
+                <p className="muted" style={{marginTop:10}}>El margen de ganancia se edita por batería en "Gestionar Baterías".</p>
               </div>
             </div>
           )}

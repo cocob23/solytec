@@ -3,9 +3,10 @@ import { supabase } from '../lib/supabaseClient';
 import logo from '../assets/logo.png';
 import { useAuth } from '../state/AuthProvider';
 
-type Battery = { voltage_v: number; ah: number; unit_price_usd: number };
+// Alinear con Admin: usar margen por batería (margen_ganancia)
+type Battery = { id?: number; ah: number; unit_price_usd: number; is_active?: boolean; margen_ganancia?: number | null };
 type CabinetBracket = { min_qty: number; max_qty: number; price_usd: number };
-type AppSettings = { gain_pct: number | null; cabinet_pct_ge12: number | null };
+type AppSettings = { gain_pct: number | null; cabinet_pct_ge12: number | null; cabinet_base_usd?: number | null; bonus_threshold_usd?: number | null; bonus_max_vendor_pct?: number | null };
 
 type CalcResult = {
   unit_price_usd: number;
@@ -29,16 +30,17 @@ export default function Calculator() {
   const [brackets, setBrackets] = useState<CabinetBracket[]>([]);
   const [settings, setSettings] = useState<AppSettings>({ gain_pct: null, cabinet_pct_ge12: null });
   const [ah, setAh] = useState<number | ''>('');
-  const [volt, setVolt] = useState<number | ''>('');
   const [qtyInput, setQtyInput] = useState<string>('');
   const [res, setRes] = useState<CalcResult | null>(null);
+  const [bonusPctInput, setBonusPctInput] = useState<string>('');
+  const [discountedPrice, setDiscountedPrice] = useState<number | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     supabase
       .from('batteries')
-      .select('*')
+      .select('id, ah, unit_price_usd, is_active, margen_ganancia')
       .eq('is_active', true)
       .then(({ data, error }) => {
         if (error) setErr(error.message);
@@ -55,11 +57,11 @@ export default function Calculator() {
     // load global settings (singleton id=1)
     supabase
       .from('app_settings')
-      .select('gain_pct, cabinet_pct_ge12')
+      .select('cabinet_pct_ge12, cabinet_base_usd, bonus_threshold_usd, bonus_max_vendor_pct')
       .limit(1)
       .single()
       .then(({ data, error }) => {
-        if (!error && data) setSettings({ gain_pct: data.gain_pct, cabinet_pct_ge12: data.cabinet_pct_ge12 });
+        if (!error && data) setSettings({ gain_pct: null, cabinet_pct_ge12: data.cabinet_pct_ge12, cabinet_base_usd: (data as any).cabinet_base_usd, bonus_threshold_usd: (data as any).bonus_threshold_usd, bonus_max_vendor_pct: (data as any).bonus_max_vendor_pct });
       });
   }, []);
 
@@ -67,46 +69,37 @@ export default function Calculator() {
     () => Array.from(new Set(bats.map((b) => b.ah))).sort((a, b) => a - b),
     [bats]
   );
-  const voltOptions = useMemo(
-    () => (ah === '' ? [] : bats.filter((b) => b.ah === ah).map((b) => b.voltage_v)),
-    [bats, ah]
-  );
-
-  useEffect(() => {
-    // reset volt when ah changes; preselect if only one
-    if (ah === '') {
-      setVolt('');
-      return;
-    }
-    const vs = voltsUnique(voltOptions);
-    if (vs.length === 1) setVolt(vs[0]);
-    else setVolt('');
-  }, [ah]);
+  // Se elimina el selector de voltaje; se calcula solo con Ah y cantidad
 
   async function calculate() {
     setErr(null);
     setRes(null);
+    setDiscountedPrice(null);
     const qty = Number(qtyInput);
-    if (ah === '' || volt === '' || !Number.isFinite(qty) || qty <= 0) {
-      setErr('Seleccioná Ah, Volt y cantidad > 0');
+    if (ah === '' || !Number.isFinite(qty) || qty <= 0) {
+      setErr('Seleccioná Ah y cantidad > 0');
       return;
     }
     setLoading(true);
-    // Encontrar precio unitario desde el catálogo cargado
-    const match = bats.find((b) => b.ah === ah && b.voltage_v === volt);
+    // Encontrar batería activa por Ah (catálogo cargado)
+    const match = bats.find((b) => b.ah === ah);
     if (!match) {
       setLoading(false);
-      setErr('No hay precio para esa combinación (Ah/Volt)');
+      setErr('No hay precio para ese Ah');
       return;
     }
   const unit = Number(match.unit_price_usd);
-  const rawGain = (settings.gain_pct ?? undefined) ?? (userRow?.gain_pct ?? CONFIG.gainPct);
-  const gainPct = rawGain > 1 ? rawGain / 100 : rawGain; // permite cargar 80 como 80%
+  // Alinear margen con Admin: usar margen_ganancia de la batería; fallback al usuario y luego a 0.25
+  const rawGain = (match.margen_ganancia ?? undefined) ?? (userRow?.gain_pct ?? CONFIG.gainPct);
+  const gainPct = rawGain > 1 ? rawGain / 100 : rawGain; // permite 80 como 80%
   const rawCabPct = (settings.cabinet_pct_ge12 ?? undefined) ?? (userRow?.cabinet_pct_ge12 ?? CONFIG.cabinetPctGe12);
   const cabinetPct = rawCabPct > 1 ? rawCabPct / 100 : rawCabPct;
   const subtotal_batteries = unit * qty;
   let cabinet_cost_usd = 0;
-  if ((ah as number) < 12) {
+  const baseCabinet = Number(settings.cabinet_base_usd ?? 0);
+  if (qty === 1 && baseCabinet > 0) {
+    cabinet_cost_usd = baseCabinet;
+  } else if ((ah as number) < 12) {
     // Bracket packing: usa gabinetes grandes tantas veces como haga falta y uno adicional para el resto
     if (!brackets || brackets.length === 0) {
       setLoading(false);
@@ -138,7 +131,13 @@ export default function Calculator() {
     }
     cabinet_cost_usd = cost;
   } else {
-    cabinet_cost_usd = (ah as number) >= 12 ? subtotal_batteries * cabinetPct : 0;
+    // Para ≥12Ah: tomar el mayor entre el costo porcentual y el costo base si este último está definido (>0)
+    if ((ah as number) >= 12) {
+      const percentCost = subtotal_batteries * cabinetPct;
+      cabinet_cost_usd = baseCabinet > 0 ? Math.max(percentCost, baseCabinet) : percentCost;
+    } else {
+      cabinet_cost_usd = 0;
+    }
   }
     const subtotal_technical = subtotal_batteries + cabinet_cost_usd;
   const final_price_usd = subtotal_technical * (1 + gainPct);
@@ -153,6 +152,30 @@ export default function Calculator() {
       currency: CONFIG.currency,
     });
     setLoading(false);
+  }
+
+  function applyBonus() {
+    if (!res) return;
+    const raw = bonusPctInput.trim();
+    if (raw === '') { setDiscountedPrice(null); return; }
+    let pct = Number(raw);
+    if (!Number.isFinite(pct) || pct < 0) { setErr('Bonificación inválida'); return; }
+    // Allow values like 10 meaning 10% and 0.1 meaning 10%
+    if (pct > 1) pct = pct / 100;
+    // Enforce vendor cap if configured
+    if (userRow?.role === 'vendor' && settings.bonus_max_vendor_pct != null && Number.isFinite(settings.bonus_max_vendor_pct)) {
+      const cap = settings.bonus_max_vendor_pct as number;
+      if (pct > cap) {
+        pct = cap;
+        setErr(`Se aplicó el tope de bonificación del ${(cap * 100).toFixed(2)}%`);
+      } else {
+        setErr(null);
+      }
+    } else {
+      setErr(null);
+    }
+    const newPrice = res.final_price_usd * (1 - pct);
+    setDiscountedPrice(newPrice);
   }
 
   return (
@@ -214,15 +237,7 @@ export default function Calculator() {
                     ))}
                   </select>
                 </div>
-                <div>
-                  <label className="label">Voltaje</label>
-                  <select className="select" value={volt} onChange={(e) => setVolt(Number(e.target.value) || '')} disabled={ah === ''}>
-                    <option value="">Elegir Volt</option>
-                    {voltsUnique(voltOptions).map((v) => (
-                      <option key={v} value={v}>{v}V</option>
-                    ))}
-                  </select>
-                </div>
+                {/* Selector de Voltaje eliminado */}
                 <div>
                   <label className="label">Cantidad</label>
                   <input
@@ -253,7 +268,42 @@ export default function Calculator() {
                   {userRow?.role === 'admin' && res.gain_pct != null && (
                     <p className="muted" style={{ marginTop: 10 }}>Margen aplicado: {(res.gain_pct * 100).toFixed(2)}%</p>
                   )}
-                  <div className="total">Precio final: USD {res.final_price_usd.toFixed(2)}</div>
+                  <div className="total" style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+                    <span>Precio final: USD {res.final_price_usd.toFixed(2)}</span>
+                    {userRow?.role === 'vendor' ? (
+                      (settings.bonus_threshold_usd != null && res.final_price_usd >= Number(settings.bonus_threshold_usd)) ? (
+                        <>
+                          <input
+                            className="input"
+                            style={{ width: 140 }}
+                            placeholder="Bonificación %"
+                            type="text"
+                            inputMode="decimal"
+                            value={bonusPctInput}
+                            onChange={(e)=> setBonusPctInput(e.target.value.replace(/[^0-9.]/g,''))}
+                          />
+                          <button className="btn" style={{ width: 'auto', padding: '0 12px' }} onClick={applyBonus}>Aplicar bonificación</button>
+                        </>
+                      ) : null
+                    ) : (
+                      // Admin siempre puede aplicar bonificación
+                      <>
+                        <input
+                          className="input"
+                          style={{ width: 140 }}
+                          placeholder="Bonificación %"
+                          type="text"
+                          inputMode="decimal"
+                          value={bonusPctInput}
+                          onChange={(e)=> setBonusPctInput(e.target.value.replace(/[^0-9.]/g,''))}
+                        />
+                        <button className="btn" style={{ width: 'auto', padding: '0 12px' }} onClick={applyBonus}>Aplicar bonificación</button>
+                      </>
+                    )}
+                  </div>
+                  {discountedPrice != null && (
+                    <div className="total" style={{ color:'#065f46' }}>Precio con bonificación: USD {discountedPrice.toFixed(2)}</div>
+                  )}
                 </div>
               )}
             </div>
