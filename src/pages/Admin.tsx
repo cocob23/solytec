@@ -159,7 +159,8 @@ export default function Admin() {
     if (raw === '') { setDiscountedPrice(null); return; }
     let pct = Number(raw);
     if (!Number.isFinite(pct) || pct < 0) { setCalcErr('Bonificación inválida'); return; }
-    if (pct > 1) pct = pct / 100; // allow 10 or 0.1
+    // Interpret numbers >= 1 as percentage (1 => 1%, 10 => 10%)
+    if (pct >= 1) pct = pct / 100;
     const newPrice = res.final_price_usd * (1 - pct);
     setDiscountedPrice(newPrice);
   }

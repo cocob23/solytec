@@ -160,8 +160,8 @@ export default function Calculator() {
     if (raw === '') { setDiscountedPrice(null); return; }
     let pct = Number(raw);
     if (!Number.isFinite(pct) || pct < 0) { setErr('Bonificación inválida'); return; }
-    // Allow values like 10 meaning 10% and 0.1 meaning 10%
-    if (pct > 1) pct = pct / 100;
+    // Interpret numbers >= 1 as percentage (1 => 1%, 10 => 10%). Values between 0 and 1 are fractions.
+    if (pct >= 1) pct = pct / 100;
     // Enforce vendor cap if configured
     if (userRow?.role === 'vendor' && settings.bonus_max_vendor_pct != null && Number.isFinite(settings.bonus_max_vendor_pct)) {
       const cap = settings.bonus_max_vendor_pct as number;
